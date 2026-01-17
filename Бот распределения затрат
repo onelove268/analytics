@@ -1,3 +1,7 @@
+# Шаг 1: Установка Streamlit и настройка туннеля
+!pip install -q streamlit pandas plotly openai pyngrok
+!npm install -g localtunnel
+
 # Шаг 2: Создаем веб-приложение на Streamlit
 %%writefile app.py
 import streamlit as st
@@ -458,3 +462,22 @@ with tab2:
 # Футер
 st.markdown("---")
 st.markdown("🤖 *AI Бот для распределения ФОТ v1.0*")
+
+# Используем встроенный прокси Colab
+from google.colab.output import eval_js
+
+# Запускаем Streamlit
+!nohup streamlit run app.py --server.port 8501 --server.headless true --server.enableCORS false &
+
+import time
+time.sleep(5)
+
+# Получаем URL через Colab proxy
+try:
+    public_url = eval_js("google.colab.kernel.proxyPort(8501)")
+    print(f"🚀 Ваше приложение доступно по адресу:")
+    print(f"📋 {public_url}")
+    print("✨ Откройте ссылку в новой вкладке!")
+except Exception as e:
+    print(f"❌ Ошибка: {e}")
+    print("🔧 Используйте альтернативные способы ниже")
