@@ -1,0 +1,460 @@
+# Шаг 2: Создаем веб-приложение на Streamlit
+%%writefile app.py
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import io
+import base64
+from datetime import datetime, timedelta
+from io import BytesIO
+import numpy as np
+from decimal import Decimal, ROUND_HALF_UP
+
+# Настройка страницы
+st.set_page_config(
+    page_title="🤖 Бот для распределения затрат по кругам",
+    page_icon="📊",
+    layout="wide"
+)
+
+# Заголовок приложения
+st.title("🤖 Бот для распределения затрат по кругам")
+st.markdown("Автоматическое распределение затрат по кругам")
+
+# Функция для правильного склонения слова "сотрудник"
+def get_employee_text(count):
+    if count % 10 == 1 and count % 100 != 11:
+        return f"{count} сотрудник"
+    elif count % 10 in [2, 3, 4] and count % 100 not in [12, 13, 14]:
+        return f"{count} сотрудника"
+    else:
+        return f"{count} сотрудников"
+
+# Функция для расчета количества дней в периоде
+def calculate_days(start_date, end_date):
+    """Рассчитывает количество дней между датами (включая обе даты)"""
+    return (end_date - start_date).days + 1
+
+# ---------- ВЫРАВНИВАНИЕ ОКРУГЛЕНИЙ (в копейках) ----------
+def _to_decimal(x) -> Decimal:
+    return Decimal(str(x).replace(",", "."))
+
+def align_employee_total(df_emp: pd.DataFrame, target_total: float, pick: str = "max_amount") -> pd.DataFrame:
+    """
+    Округляет строки до 2 знаков и докидывает/убирает разницу (в копейках)
+    в выбранную строку, чтобы итог по сотруднику совпал с ФОТ.
+
+    pick:
+      - "max_amount": докидываем в строку с максимальной суммой
+      - "max_days":   докидываем в строку с максимальным количеством дней
+    """
+    if df_emp.empty:
+        return df_emp
+
+    df_emp = df_emp.copy()
+
+    # целевой итог в копейках
+    target_cents = int((_to_decimal(target_total) * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+    # округляем каждую строку и переводим в копейки
+    cents_list = []
+    for v in df_emp["Сумма с учетом занятости"].tolist():
+        d = _to_decimal(v).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        cents_list.append(int((d * 100).to_integral_value(rounding=ROUND_HALF_UP)))
+
+    df_emp["_cents"] = cents_list
+
+    distributed_cents = int(df_emp["_cents"].sum())
+    diff_cents = target_cents - distributed_cents  # сколько копеек надо докинуть/убрать
+
+    if diff_cents != 0:
+        if pick == "max_days" and "Количество дней" in df_emp.columns:
+            idx = df_emp["Количество дней"].idxmax()
+        else:
+            idx = df_emp["_cents"].idxmax()
+        df_emp.loc[idx, "_cents"] = int(df_emp.loc[idx, "_cents"]) + int(diff_cents)
+
+    df_emp["Сумма с учетом занятости"] = (df_emp["_cents"] / 100).round(2)
+    df_emp.drop(columns=["_cents"], inplace=True)
+    return df_emp
+
+# Функция для распределения суммы по периодам
+def distribute_by_periods_simple(salary_data, distribution_data):
+    """
+    Распределяет зарплату по под-периодам с учетом смены кругов и % занятости.
+    ВАЖНО: не округляет построчно сразу; округление + выравнивание делается
+    одним шагом в конце по каждому сотруднику (в копейках).
+    """
+    result_rows = []
+
+    for _, salary_row in salary_data.iterrows():
+        employee = salary_row["Сотрудник"]
+        total_salary = float(str(salary_row["ФОТ"]).replace(",", "."))
+        salary_start = pd.to_datetime(salary_row["Начало периода"])
+        salary_end = pd.to_datetime(salary_row["Конец периода"])
+        total_days = (salary_end - salary_start).days + 1
+        daily_salary = total_salary / total_days
+
+        # Берем распределения сотрудника
+        emp_distributions = distribution_data[
+            (distribution_data["Сотрудник"] == employee)
+        ].copy()
+
+        if emp_distributions.empty:
+            continue
+
+        emp_distributions["Дата начала"] = pd.to_datetime(emp_distributions["Дата начала"])
+        emp_distributions = emp_distributions.sort_values("Дата начала")
+
+        temp_rows = []
+
+        # Для каждой строки распределения формируем период до следующего изменения
+        for _, dist_row in emp_distributions.iterrows():
+            period_start = max(dist_row["Дата начала"], salary_start)
+
+            next_dist_rows = emp_distributions[emp_distributions["Дата начала"] > dist_row["Дата начала"]]
+            if not next_dist_rows.empty:
+                next_start = next_dist_rows["Дата начала"].min() - pd.Timedelta(days=1)
+                period_end = min(next_start, salary_end)
+            else:
+                period_end = salary_end
+
+            if period_end < period_start:
+                continue
+
+            period_days = (period_end - period_start).days + 1
+            period_salary = daily_salary * period_days
+
+            # НЕ округляем здесь!
+            sum_with_percent = period_salary * dist_row["% занятости"] / 100
+
+            result_row = {
+                "Сотрудник": employee,
+                "Сумма": total_salary,
+                "Период выплаты": f"{salary_start.strftime('%d.%m.%Y')} - {salary_end.strftime('%d.%m.%Y')}",
+                "Распределяемый период (начало)": period_start.strftime("%d.%m.%Y"),
+                "Распределяемый период (конец)": period_end.strftime("%d.%m.%Y"),
+                "Количество дней": period_days,
+                "% занятости": dist_row["% занятости"],
+                "Сумма с учетом занятости": sum_with_percent
+            }
+
+            # Добавляем колонки кругов
+            exclude_columns = ["Сотрудник", "% занятости", "Дата начала"]
+            circle_columns = [col for col in distribution_data.columns if col not in exclude_columns]
+            for col in circle_columns:
+                result_row[col] = dist_row[col]
+
+            temp_rows.append(result_row)
+
+        # Округляем и выравниваем ИТОГ по сотруднику (в копейках)
+        df_temp = pd.DataFrame(temp_rows)
+        if not df_temp.empty:
+            df_temp = align_employee_total(df_temp, total_salary, pick="max_amount")  # "max_days" если нужно по дням
+
+        result_rows.extend(df_temp.to_dict("records"))
+
+    return pd.DataFrame(result_rows)
+
+# Инициализация состояния сессии
+if "salary_data" not in st.session_state:
+    st.session_state.salary_data = None
+if "distribution_data" not in st.session_state:
+    st.session_state.distribution_data = None
+if "result_data" not in st.session_state:
+    st.session_state.result_data = None
+if "original_total_fot" not in st.session_state:
+    st.session_state.original_total_fot = 0
+
+# Сайдбар для загрузки файлов
+with st.sidebar:
+    st.header("📁 Загрузка данных")
+
+    # Загрузка файла с зарплатами
+    st.subheader("Файл с зарплатами")
+    salary_file = st.file_uploader(
+        "Загрузите CSV/Excel с ФОТ",
+        type=["csv", "xlsx"],
+        key="salary_uploader"
+    )
+
+    if salary_file:
+        try:
+            if salary_file.name.endswith(".csv"):
+                st.session_state.salary_data = pd.read_csv(salary_file)
+            else:
+                st.session_state.salary_data = pd.read_excel(salary_file)
+
+            # Переименовываем столбцы для унификации
+            if "Сумма" in st.session_state.salary_data.columns and "ФОТ" not in st.session_state.salary_data.columns:
+                st.session_state.salary_data = st.session_state.salary_data.rename(columns={"Сумма": "ФОТ"})
+
+            # Преобразуем даты
+            date_columns = ["Начало периода", "Конец периода"]
+            for col in date_columns:
+                if col in st.session_state.salary_data.columns:
+                    st.session_state.salary_data[col] = pd.to_datetime(st.session_state.salary_data[col], format="mixed")
+
+            employee_count = len(st.session_state.salary_data)
+            st.success(f"✅ Загружено {get_employee_text(employee_count)}")
+        except Exception as e:
+            st.error(f"❌ Ошибка загрузки: {e}")
+
+    # Загрузка файла с распределением
+    st.subheader("Файл с распределением")
+    distribution_file = st.file_uploader(
+        "Загрузите CSV/Excel с процентами",
+        type=["csv", "xlsx"],
+        key="distribution_uploader"
+    )
+
+    if distribution_file:
+        try:
+            if distribution_file.name.endswith(".csv"):
+                st.session_state.distribution_data = pd.read_csv(distribution_file)
+            else:
+                st.session_state.distribution_data = pd.read_excel(distribution_file)
+
+            # Преобразуем даты (только Дата начала)
+            if "Дата начала" in st.session_state.distribution_data.columns:
+                st.session_state.distribution_data["Дата начала"] = pd.to_datetime(
+                    st.session_state.distribution_data["Дата начала"], format="mixed"
+                )
+
+            unique_employees_count = st.session_state.distribution_data["Сотрудник"].nunique()
+            st.success(f"✅ Загружено {get_employee_text(unique_employees_count)}")
+        except Exception as e:
+            st.error(f"❌ Ошибка загрузки: {e}")
+
+    # Кнопка для примеров данных
+    if st.button("🔄 Создать пример данных"):
+        st.session_state.salary_data = pd.DataFrame({
+            "Сотрудник": ["Иванов Иван Иванович", "Петрова Мария Олеговна"],
+            "ФОТ": [66687.67, 40000],
+            "Начало периода": [datetime(2025, 11, 1), datetime(2025, 11, 1)],
+            "Конец периода": [datetime(2025, 11, 15), datetime(2025, 11, 15)]
+        })
+
+        st.session_state.distribution_data = pd.DataFrame({
+            "Сотрудник": ["Иванов Иван Иванович", "Иванов Иван Иванович", "Петрова Мария Олеговна"],
+            "Главный круг": ["3 | R&D", "1100 | Board of director", "800 | OPS"],
+            "Подкруг 1": ["3.18 | C1. Team.Two (T2)", "1110 | Board of director", "8110 | Docs"],
+            "Подкруг 2": ["3.18.1 | C1. Team.Two (T2) GEN", "1111 | Board of director", "8112 | K.Docs"],
+            "% занятости": [100, 100, 100],
+            "Дата начала": [datetime(2025, 11, 1), datetime(2025, 11, 8), datetime(2025, 11, 1)]
+        })
+
+        salary_count = len(st.session_state.salary_data)
+        distribution_count = st.session_state.distribution_data["Сотрудник"].nunique()
+        st.success(
+            f"✅ Примеры данных созданы! Загружено {get_employee_text(salary_count)} с зарплатами и "
+            f"{get_employee_text(distribution_count)} с распределением"
+        )
+
+# Главная область контента
+tab1, tab2 = st.tabs(["📊 Данные", "🧮 Распределение"])
+
+with tab1:
+    st.header("Просмотр данных")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Данные по затратам")
+        if st.session_state.salary_data is not None:
+            employee_count = len(st.session_state.salary_data)
+            total_fot = st.session_state.salary_data["ФОТ"].sum()
+            st.write(f"**Всего: {get_employee_text(employee_count)}**")
+            st.write(f"**Общий ФОТ: {total_fot:,.2f} руб.**")
+
+            display_salary_data = st.session_state.salary_data.copy()
+            for col in ["Начало периода", "Конец периода"]:
+                if col in display_salary_data.columns:
+                    display_salary_data[col] = display_salary_data[col].dt.strftime("%d.%m.%Y")
+
+            st.dataframe(display_salary_data, use_container_width=True)
+        else:
+            st.info("📝 Загрузите файл с зарплатами в сайдбаре")
+
+    with col2:
+        st.subheader("Данные по сотрудникам")
+        if st.session_state.distribution_data is not None:
+            unique_employees_count = st.session_state.distribution_data["Сотрудник"].nunique()
+            total_rows_count = len(st.session_state.distribution_data)
+            st.write(f"**Всего: {get_employee_text(unique_employees_count)} ({total_rows_count} записей распределения)**")
+            st.info("💡 Используется только 'Дата начала'. Распределение действует до конца периода выплаты.")
+
+            display_distribution_data = st.session_state.distribution_data.copy()
+            if "Дата начала" in display_distribution_data.columns:
+                display_distribution_data["Дата начала"] = display_distribution_data["Дата начала"].dt.strftime("%d.%m.%Y")
+
+            st.dataframe(display_distribution_data, use_container_width=True)
+        else:
+            st.info("📝 Загрузите файл с распределением в сайдбаре")
+
+    # ---------- ПРОВЕРКА СООТВЕТСТВИЯ ФАЙЛОВ ----------
+    if st.session_state.salary_data is not None and st.session_state.distribution_data is not None:
+        st.divider()
+        st.subheader("🔎 Проверка наличия распределений")
+
+        salary_df = st.session_state.salary_data.copy()
+        dist_df = st.session_state.distribution_data.copy()
+        salary_df.columns = salary_df.columns.str.strip()
+        dist_df.columns = dist_df.columns.str.strip()
+
+        salary_employees = set(salary_df["Сотрудник"].dropna().unique())
+        distribution_employees = set(dist_df["Сотрудник"].dropna().unique())
+
+        missing_employees = salary_employees - distribution_employees
+
+        if missing_employees:
+            missing_table = salary_df[
+                salary_df["Сотрудник"].isin(missing_employees)
+            ][["Сотрудник", "ФОТ", "Начало периода", "Конец периода"]].copy()
+
+            missing_table["Начало периода"] = missing_table["Начало периода"].dt.strftime("%d.%m.%Y")
+            missing_table["Конец периода"] = missing_table["Конец периода"].dt.strftime("%d.%m.%Y")
+
+            st.warning("⚠️ Найдены сотрудники, у которых есть ФОТ, но нет распределения")
+            st.dataframe(missing_table, use_container_width=True)
+
+            st.session_state.missing_employees = missing_table
+        else:
+            st.success("✅ Все сотрудники из файла с ФОТ имеют распределение")
+
+with tab2:
+    st.header("Распределение ФОТ")
+
+    if st.session_state.salary_data is not None and st.session_state.distribution_data is not None:
+        required_salary_columns = ["Сотрудник", "ФОТ", "Начало периода", "Конец периода"]
+        required_distribution_columns = ["Сотрудник", "% занятости", "Дата начала"]
+
+        missing_salary_columns = [col for col in required_salary_columns if col not in st.session_state.salary_data.columns]
+        missing_distribution_columns = [col for col in required_distribution_columns if col not in st.session_state.distribution_data.columns]
+
+        if missing_salary_columns:
+            st.error(f"❌ В файле с зарплатами отсутствуют необходимые колонки: {missing_salary_columns}")
+        elif missing_distribution_columns:
+            st.error(f"❌ В файле с распределением отсутствуют необходимые колонки: {missing_distribution_columns}")
+        else:
+            if st.button("🚀 Запустить распределение", type="primary"):
+                with st.spinner("Выполняю распределение с учетом периодов..."):
+                    try:
+                        st.session_state.original_total_fot = st.session_state.salary_data["ФОТ"].sum()
+
+                        # Выполняем распределение по периодам (уже с выравниванием и округлением)
+                        result_data = distribute_by_periods_simple(
+                            st.session_state.salary_data,
+                            st.session_state.distribution_data
+                        )
+
+                        if not result_data.empty:
+                            st.session_state.result_data = result_data
+
+                            # Определяем колонки с кругами
+                            exclude_columns = [
+                                "Сотрудник", "Сумма", "Период выплаты",
+                                "Распределяемый период (начало)", "Распределяемый период (конец)",
+                                "Количество дней", "% занятости", "Сумма с учетом занятости"
+                            ]
+                            circle_columns = [col for col in result_data.columns if col not in exclude_columns]
+                            st.session_state.circle_columns = circle_columns
+
+                            total_employees = result_data["Сотрудник"].nunique()
+                            total_records = len(result_data)
+                            st.success(f"✅ Распределение завершено! Обработано {get_employee_text(total_employees)} ({total_records} периодов распределения)")
+                        else:
+                            st.error("❌ Не удалось выполнить распределение. Проверьте соответствие периодов в файлах.")
+
+                    except Exception as e:
+                        st.error(f"❌ Ошибка при распределении: {e}")
+                        st.info("💡 Подсказка: Проверьте формат дат и соответствие имен сотрудников")
+
+        # Показываем результаты
+        if st.session_state.result_data is not None:
+            st.subheader("Результаты распределения")
+
+            total_employees = st.session_state.result_data["Сотрудник"].nunique()
+            total_records = len(st.session_state.result_data)
+            st.write(f"**Обработано: {get_employee_text(total_employees)} ({total_records} периодов распределения)**")
+
+            # Проверяем точность распределения
+            accuracy_check = st.session_state.result_data.groupby("Сотрудник").agg({
+                "Сумма": "first",
+                "Сумма с учетом занятости": "sum"
+            }).reset_index()
+            accuracy_check["Разница"] = (accuracy_check["Сумма"] - accuracy_check["Сумма с учетом занятости"]).round(2)
+
+            perfect_matches = len(accuracy_check[abs(accuracy_check["Разница"]) < 0.01])
+            significant_diff = len(accuracy_check[abs(accuracy_check["Разница"]) >= 0.01])
+
+            if significant_diff > 0:
+                st.warning(f"⚠️ Обнаружены расхождения у {significant_diff} сотрудников")
+                st.dataframe(accuracy_check[abs(accuracy_check["Разница"]) >= 0.01])
+            else:
+                st.success(f"✅ Все суммы выровнены. Сошлось у {perfect_matches} сотрудников.")
+
+            st.dataframe(st.session_state.result_data, use_container_width=True)
+
+            # Общая статистика
+            st.subheader("Общая статистика")
+            total_original_fot = float(st.session_state.original_total_fot)
+            total_distributed_fot = float(st.session_state.result_data["Сумма с учетом занятости"].sum())
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Общий ФОТ", f"{total_original_fot:,.2f} руб.")
+            with col2:
+                st.metric("Распределенный ФОТ", f"{total_distributed_fot:,.2f} руб.")
+            with col3:
+                difference = total_original_fot - total_distributed_fot
+                st.metric("Разница", f"{difference:.2f} руб.")
+
+            # Сводка по кругам
+            st.subheader("Сводка по кругам")
+
+            circle_summary_rows = []
+            for _, row in st.session_state.result_data.iterrows():
+                circle_summary_rows.append({
+                    "Сотрудник": row["Сотрудник"],
+                    "Главный круг": row.get("Главный круг", None),
+                    "Подкруг 1": row.get("Подкруг 1", None),
+                    "Подкруг 2": row.get("Подкруг 2", None),
+                    "Сумма": row["Сумма с учетом занятости"],
+                    "Количество периодов": 1
+                })
+
+            circle_summary = pd.DataFrame(circle_summary_rows)
+
+            if not circle_summary.empty:
+                final_summary = circle_summary.groupby(
+                    ["Сотрудник", "Главный круг", "Подкруг 1", "Подкруг 2"],
+                    dropna=False
+                ).agg({"Сумма": "sum"}).reset_index()
+
+                st.session_state.circle_summary = final_summary
+                st.dataframe(final_summary, use_container_width=True)
+
+            # Кнопка скачивания
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                st.session_state.result_data.to_excel(writer, sheet_name="Распределение ФОТ", index=False)
+                if "circle_summary" in st.session_state and st.session_state.circle_summary is not None:
+                    st.session_state.circle_summary.to_excel(writer, sheet_name="Сводка по кругам", index=False)
+
+            output.seek(0)
+
+            st.download_button(
+                "📥 Скачать результаты распределения",
+                output,
+                "распределение_фот.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download-excel"
+            )
+    else:
+        st.info("📝 Загрузите оба файла данных для начала распределения")
+
+# Футер
+st.markdown("---")
+st.markdown("🤖 *AI Бот для распределения ФОТ v1.0*")
